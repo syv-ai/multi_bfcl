@@ -16,7 +16,6 @@ from tqdm.auto import tqdm
 
 from multi_bfcl.data_loading import load_bfcl, load_languages
 from multi_bfcl.data_models import Example
-from multi_bfcl.languages import DANISH
 from multi_bfcl.translation import translate_example
 
 load_dotenv()
@@ -49,10 +48,6 @@ def main(model: str, api_base: str) -> None:
     for language in tqdm(
         iterable=load_languages(), desc="Translating datasets", unit="dataset"
     ):
-        # TEMP
-        if language != DANISH:
-            continue
-
         language_examples = deepcopy(examples)
 
         language_output_path = output_dir / f"bfcl-{language.code}.jsonl"
