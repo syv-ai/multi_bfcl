@@ -8,6 +8,7 @@ import collections.abc as c
 import queue
 import random
 import threading
+import time
 import typing as t
 import warnings
 from concurrent.futures import FIRST_COMPLETED, Future, wait
@@ -25,6 +26,10 @@ from multi_bfcl.languages import Language
 from multi_bfcl.translation import translate_example
 
 load_dotenv()
+
+_MAX_ATTEMPTS = 5
+_INITIAL_BACKOFF_SECONDS = 1.0
+_MAX_BACKOFF_SECONDS = 30.0
 
 
 class _DaemonExecutor:
@@ -165,8 +170,13 @@ def main(model: str, api_base: str, concurrency: int) -> None:
 
     examples = load_bfcl()
 
+    languages = _retry(
+        operation=load_languages,
+        description="loading the MultiWikiQA language list",
+        retryable=_is_transient_language_load_error,
+    )
     for language in tqdm(
-        iterable=load_languages(), desc="Translating datasets", unit="dataset"
+        iterable=languages, desc="Translating datasets", unit="dataset"
     ):
         language_examples = list(examples)
 
@@ -179,14 +189,20 @@ def main(model: str, api_base: str, concurrency: int) -> None:
                 for example in language_examples
                 if example.id not in existing_ids
             ]
+        if not language_examples:
+            continue
 
         dataset = t.cast(
             Dataset,
-            load_dataset(
-                "alexandrainst/multi-wiki-qa",
-                name=language.code,
-                split="train",
-                download_config=DownloadConfig(disable_tqdm=True),
+            _retry(
+                operation=lambda: load_dataset(
+                    "alexandrainst/multi-wiki-qa",
+                    name=language.code,
+                    split="train",
+                    download_config=DownloadConfig(disable_tqdm=True),
+                ),
+                description=f"loading MultiWikiQA dataset for {language.code}",
+                retryable=_is_transient_language_load_error,
             ),
         )
 
@@ -221,6 +237,8 @@ def _translate_examples(
     Raises:
         KeyboardInterrupt:
             When the user interrupts translation; completed calls are checkpointed.
+        RuntimeError:
+            When a translation fails after exhausting retries or on a permanent error.
     """
     if not examples:
         return
@@ -238,24 +256,25 @@ def _translate_examples(
     )
 
     def translate(example: Example, context: str) -> Example:
-        return translate_example(
-            example=example,
-            language=language,
-            language_example=context,
-            model=model,
-            api_base=api_base,
+        return _retry(
+            operation=lambda: translate_example(
+                example=example,
+                language=language,
+                language_example=context,
+                model=model,
+                api_base=api_base,
+            ),
+            description=f"translating example {example.id} to {language.name}",
+            retryable=_is_transient_translation_error,
         )
 
     def save(future: Future[Example], example: Example) -> None:
         try:
             translated = future.result()
         except Exception as error:
-            click.echo(
-                f"Failed to translate example {example.id} to {language.name}. "
-                f"Skipping. Here are the errors that occurred:\n{error}",
-                err=True,
-            )
-            return
+            raise RuntimeError(
+                f"Failed to translate example {example.id} to {language.name}"
+            ) from error
         with output_path.open("a") as output_file:
             output_file.write(translated.model_dump_json() + "\n")
 
@@ -264,12 +283,9 @@ def _translate_examples(
             try:
                 translated = translate(example, context)
             except Exception as error:
-                click.echo(
-                    f"Failed to translate example {example.id} to {language.name}. "
-                    f"Skipping. Here are the errors that occurred:\n{error}",
-                    err=True,
-                )
-                continue
+                raise RuntimeError(
+                    f"Failed to translate example {example.id} to {language.name}"
+                ) from error
             with output_path.open("a") as output_file:
                 output_file.write(translated.model_dump_json() + "\n")
         return
@@ -299,8 +315,104 @@ def _translate_examples(
             if future.done() and not future.cancelled():
                 save(future, example)
         raise
+    except Exception:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+
+
+_Result = t.TypeVar("_Result")
+
+
+def _retry(
+    operation: c.Callable[[], _Result],
+    description: str,
+    retryable: c.Callable[[Exception], bool],
+) -> _Result:
+    """Retry transient failures a bounded number of times with jitter.
+
+    Args:
+        operation:
+            Operation to execute.
+        description:
+            Human-readable operation name for diagnostics.
+        retryable:
+            Predicate identifying failures that may recover.
+
+    Returns:
+        The operation result.
+
+    Raises:
+        AssertionError:
+            If the retry loop exits unexpectedly.
+    """
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        try:
+            return operation()
+        except Exception as error:
+            if attempt == _MAX_ATTEMPTS or not retryable(error):
+                raise
+            delay = min(
+                _INITIAL_BACKOFF_SECONDS * 2 ** (attempt - 1), _MAX_BACKOFF_SECONDS
+            ) * random.uniform(0.5, 1.5)
+            click.echo(
+                f"Transient failure while {description} "
+                f"(attempt {attempt}/{_MAX_ATTEMPTS}); retrying in {delay:.1f}s: "
+                f"{error}",
+                err=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("Unreachable retry state")
+
+
+def _is_transient_translation_error(error: Exception) -> bool:
+    """Identify network and rate-limit failures that can recover on retry.
+
+    Returns:
+        Whether the error is likely to be transient.
+    """
+    status = getattr(error, "status_code", None)
+    if status is None:
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+    if status == 429 or (isinstance(status, int) and status >= 500):
+        return True
+    if isinstance(status, int) and 400 <= status < 500:
+        return False
+    message = f"{type(error).__name__}: {error}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "fetch failed",
+            "request was aborted",
+            "connection error",
+            "connection reset",
+            "connection refused",
+            "timed out",
+            "timeout",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "could not resolve",
+            "server disconnected",
+            "too many requests",
+            "rate limit",
+        )
+    )
+
+
+def _is_transient_language_load_error(error: Exception) -> bool:
+    """Identify network failures, including Hugging Face's misleading cache error.
+
+    Returns:
+        Whether the error is likely to be transient.
+    """
+    message = str(error).lower()
+    if isinstance(error, ValueError) and "couldn't find cache" in message:
+        return True
+    return _is_transient_translation_error(error)
 
 
 def _usable_contexts(contexts: list[str]) -> c.Iterator[str]:
