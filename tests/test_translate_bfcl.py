@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, Future, wait
 from pathlib import Path
 
+import litellm
 import pytest
 from click.testing import CliRunner
 
@@ -125,6 +126,20 @@ def test_transient_translation_failures_are_retried(
     ]
     assert sorted(ids) == ["example-0", "example-1", "example-2"]
     assert set(attempts.values()) == {2}
+
+
+@pytest.mark.parametrize(
+    ("status_code", "retryable"), [(499, True), (429, True), (400, False)]
+)
+def test_proxy_error_status_classification(status_code: int, retryable: bool) -> None:
+    """A proxy-aborted request is retryable, unlike a bad request."""
+    error = litellm.APIError(
+        status_code=status_code,
+        message="Request was aborted",
+        llm_provider="openai",
+        model="gpt-6-sol",
+    )
+    assert translate_bfcl._is_transient_translation_error(error) is retryable
 
 
 def test_permanent_translation_failure_aborts_and_keeps_checkpoint(

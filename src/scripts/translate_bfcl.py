@@ -381,7 +381,7 @@ def _is_transient_translation_error(error: Exception) -> bool:
     if status is None:
         response = getattr(error, "response", None)
         status = getattr(response, "status_code", None)
-    if status == 429 or (isinstance(status, int) and status >= 500):
+    if status in (429, 499) or (isinstance(status, int) and status >= 500):
         return True
     if isinstance(status, int) and 400 <= status < 500:
         return False
