@@ -6,13 +6,14 @@ Usage:
 
 import collections.abc as c
 import random
+import typing as t
 import warnings
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from string import punctuation
 
 import click
-from datasets import DownloadConfig, disable_progress_bars, load_dataset
+from datasets import Dataset, DownloadConfig, disable_progress_bars, load_dataset
 from dotenv import load_dotenv
 from tqdm.auto import tqdm
 
@@ -75,14 +76,21 @@ def main(model: str, api_base: str, concurrency: int) -> None:
                 if example.id not in existing_ids
             ]
 
-        dataset = load_dataset(
-            "alexandrainst/multi-wiki-qa",
-            name=language.code,
-            split="train",
-            download_config=DownloadConfig(disable_tqdm=True),
+        dataset = t.cast(
+            Dataset,
+            load_dataset(
+                "alexandrainst/multi-wiki-qa",
+                name=language.code,
+                split="train",
+                download_config=DownloadConfig(disable_tqdm=True),
+            ),
         )
 
-        contexts = [row["context"] for row in dataset if row["context"]]
+        contexts: list[str] = []
+        for index in range(len(dataset)):
+            row = t.cast(dict[str, str], dataset[index])
+            if row["context"]:
+                contexts.append(row["context"])
         random.shuffle(contexts)
         _translate_examples(
             examples=language_examples,

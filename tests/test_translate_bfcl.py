@@ -74,7 +74,7 @@ def test_default_concurrency_is_sequential(
     assert len(ids) == 5
     assert len(set(ids)) == 5
     help_result = CliRunner().invoke(translate_bfcl.main, ["--help"])
-    assert "[default: 1]" in help_result.output
+    assert "[default: 1; x>=1]" in help_result.output
 
 
 def test_concurrency_runs_multiple_translations(
@@ -167,4 +167,4 @@ def test_concurrency_must_be_positive() -> None:
     """The CLI rejects a zero worker count."""
     result = CliRunner().invoke(translate_bfcl.main, ["--concurrency", "0"])
     assert result.exit_code != 0
-    assert "at least 1" in result.output
+    assert "0 is not in the range x>=1" in result.output
