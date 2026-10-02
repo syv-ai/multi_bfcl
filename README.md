@@ -2,8 +2,8 @@
 <!-- markdownlint-disable MD041 -->
 <a href="https://github.com/syv-ai/multi_bfcl">
 <img
- src="https://syv.ai/syv-ai-logo.svg"
- width="239"
+ src="assets/syv-ai-logo.svg"
+ width="96"
  align="right"
  alt="syv.ai Logo"
 />
