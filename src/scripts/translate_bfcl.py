@@ -5,10 +5,12 @@ Usage:
 """
 
 import collections.abc as c
+import queue
 import random
+import threading
 import typing as t
 import warnings
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from pathlib import Path
 from string import punctuation
 
@@ -23,6 +25,113 @@ from multi_bfcl.languages import Language
 from multi_bfcl.translation import translate_example
 
 load_dotenv()
+
+
+class _DaemonExecutor:
+    """Small executor whose in-flight network calls cannot block process exit."""
+
+    def __init__(self, max_workers: int) -> None:
+        self._tasks: queue.Queue[
+            tuple[Future[Example], c.Callable[[], Example]] | None
+        ] = queue.Queue()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._workers = [
+            threading.Thread(target=self._work, daemon=True) for _ in range(max_workers)
+        ]
+        for worker in self._workers:
+            worker.start()
+
+    def submit(
+        self,
+        function: c.Callable[[Example, str], Example],
+        example: Example,
+        context: str,
+    ) -> Future[Example]:
+        """Schedule a translation on a daemon worker.
+
+        Returns:
+            The future for the scheduled translation.
+
+        Raises:
+            RuntimeError:
+                If the executor has been shut down.
+        """
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Cannot submit to a shut down executor")
+            future: Future[Example] = Future()
+            self._tasks.put((future, lambda: function(example, context)))
+            return future
+
+    def shutdown(self, wait: bool, cancel_futures: bool = False) -> None:
+        """Stop accepting work and optionally wait for workers to finish."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if cancel_futures:
+                while True:
+                    try:
+                        item = self._tasks.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is not None:
+                        item[0].cancel()
+            for _ in self._workers:
+                self._tasks.put(None)
+        if wait:
+            for worker in self._workers:
+                worker.join()
+
+    def _work(self) -> None:
+        while True:
+            task = self._tasks.get()
+            if task is None:
+                return
+            future, function = task
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(function())
+            except BaseException as error:
+                future.set_exception(error)
+
+
+def _load_checkpoint(path: Path) -> list[Example]:
+    """Load a checkpoint and discard only an invalid, unterminated last record.
+
+    Args:
+        path:
+            JSONL checkpoint path.
+
+    Returns:
+        Valid examples from the checkpoint.
+
+    Raises:
+        ValueError:
+            If any complete record is malformed.
+    """
+    content = path.read_bytes()
+    lines = content.splitlines(keepends=True)
+    examples: list[Example] = []
+    offset = 0
+    for index, line in enumerate(lines):
+        is_final_partial = index == len(lines) - 1 and not line.endswith(b"\n")
+        try:
+            example = Example.model_validate_json(line)
+        except ValueError:
+            if not is_final_partial:
+                raise
+            path.write_bytes(content[:offset])
+            break
+        examples.append(example)
+        offset += len(line)
+    else:
+        if content and not content.endswith(b"\n"):
+            with path.open("ab") as checkpoint:
+                checkpoint.write(b"\n")
+    return examples
 
 
 @click.command()
@@ -63,12 +172,7 @@ def main(model: str, api_base: str, concurrency: int) -> None:
 
         language_output_path = output_dir / f"bfcl-{language.code}.jsonl"
         if language_output_path.exists():
-            with language_output_path.open() as f:
-                existing_examples = [
-                    Example.model_validate_json(line)
-                    for line in f.readlines()
-                    if line.strip()
-                ]
+            existing_examples = _load_checkpoint(language_output_path)
             existing_ids = {example.id for example in existing_examples}
             language_examples = [
                 example
@@ -170,7 +274,7 @@ def _translate_examples(
                 output_file.write(translated.model_dump_json() + "\n")
         return
 
-    executor = ThreadPoolExecutor(max_workers=concurrency)
+    executor = _DaemonExecutor(max_workers=concurrency)
     pending: dict[Future[Example], Example] = {}
     iterator = iter(progress)
     try:
@@ -190,9 +294,9 @@ def _translate_examples(
     except KeyboardInterrupt:
         for future in pending:
             future.cancel()
-        executor.shutdown(wait=True, cancel_futures=True)
+        executor.shutdown(wait=False, cancel_futures=True)
         for future, example in pending.items():
-            if not future.cancelled():
+            if future.done() and not future.cancelled():
                 save(future, example)
         raise
     finally:
