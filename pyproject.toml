@@ -4,10 +4,10 @@ version = "0.0.0"
 description = "Machine-translated version of the BFCL-v2 benchmark."
 readme = "README.md"
 authors = [
-    {name = "Dan Saattrup Smart", email = "dan.smart@alexandra.dk"},
+    {name = "Dan Saattrup Smart", email = "dan@syv.ai"},
 ]
 maintainers = [
-    {name = "Dan Saattrup Smart", email = "dan.smart@alexandra.dk"},
+    {name = "Dan Saattrup Smart", email = "dan@syv.ai"},
 ]
 requires-python = ">=3.12,<4.0"
 dependencies = [
@@ -16,8 +16,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/alexandrainst/multi_bfcl"
-Issues = "https://github.com/alexandrainst/multi_bfcl/issues"
+Repository = "https://github.com/syv-ai/multi_bfcl"
+Issues = "https://github.com/syv-ai/multi_bfcl/issues"
 
 [project.license]
 file = "LICENSE"
