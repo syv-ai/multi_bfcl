@@ -319,6 +319,9 @@ def _translate_examples(
         for future in pending:
             future.cancel()
         executor.shutdown(wait=False, cancel_futures=True)
+        for future, example in pending.items():
+            if future.done() and not future.cancelled() and future.exception() is None:
+                save(future, example)
         raise
     finally:
         executor.shutdown(wait=False, cancel_futures=True)

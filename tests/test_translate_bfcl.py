@@ -3,7 +3,7 @@
 import importlib.util
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, wait
+from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, Future, wait
 from pathlib import Path
 
 import pytest
@@ -162,6 +162,49 @@ def test_permanent_translation_failure_aborts_and_keeps_checkpoint(
         Example.model_validate_json(line).id
         for line in output_path.read_text().splitlines()
     ] == ["example-0"]
+
+
+def test_concurrent_failure_checkpoints_completed_successes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed future does not discard other already-completed results."""
+
+    def fake_translate(
+        example: Example,
+        language: Language,
+        language_example: str,
+        model: str,
+        api_base: str | None,
+    ) -> Example:
+        if example.id == "example-0":
+            raise ValueError("invalid request")
+        return example
+
+    def report_failure_first(
+        futures: set[Future[Example]], return_when: str = FIRST_COMPLETED
+    ) -> tuple[set[Future[Example]], set[Future[Example]]]:
+        done, _ = wait(futures, return_when=ALL_COMPLETED)
+        failures = {future for future in done if future.exception() is not None}
+        return failures, done - failures
+
+    monkeypatch.setattr(translate_bfcl, "translate_example", fake_translate)
+    monkeypatch.setattr(translate_bfcl, "wait", report_failure_first)
+    output_path = tmp_path / "output.jsonl"
+    with pytest.raises(RuntimeError, match="example-0"):
+        translate_bfcl._translate_examples(
+            examples=_examples(3),
+            contexts=["ordinary context"],
+            language=Language(code="xx", name="Example"),
+            output_path=output_path,
+            model="offline",
+            api_base="",
+            concurrency=3,
+        )
+    ids = [
+        Example.model_validate_json(line).id
+        for line in output_path.read_text().splitlines()
+    ]
+    assert sorted(ids) == ["example-1", "example-2"]
 
 
 def test_resume_skips_existing_ids(
