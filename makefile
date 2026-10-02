@@ -84,7 +84,7 @@ add-repo-to-git:
 		git commit --quiet -m "Initial commit"; \
 	fi
 	@if [ "$(shell git remote)" = "" ]; then \
-		git remote add origin git@github.com:alexandrainst/multi_bfcl.git; \
+		git remote add origin git@github.com:syv-ai/multi_bfcl.git; \
 	fi
 
 docs:  ## View documentation locally
@@ -93,7 +93,7 @@ docs:  ## View documentation locally
 
 publish-docs:  ## Publish documentation to GitHub Pages
 	@uv run mkdocs gh-deploy
-	@echo "Updated documentation website: https://alexandrainst.github.io/multi_bfcl"
+	@echo "Updated documentation website: https://syv-ai.github.io/multi_bfcl"
 
 test:  ## Run tests
 	@uv run pytest && uv run readme-cov
