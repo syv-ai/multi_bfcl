@@ -4,18 +4,21 @@ Usage:
     uv run src/scripts/translate_bfcl.py [--model MODEL] [--api-base API_BASE]
 """
 
+import collections.abc as c
+import random
 import warnings
-from copy import deepcopy
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from string import punctuation
 
 import click
-from datasets import Dataset, DownloadConfig, disable_progress_bars, load_dataset
+from datasets import DownloadConfig, disable_progress_bars, load_dataset
 from dotenv import load_dotenv
 from tqdm.auto import tqdm
 
 from multi_bfcl.data_loading import load_bfcl, load_languages
 from multi_bfcl.data_models import Example
+from multi_bfcl.languages import Language
 from multi_bfcl.translation import translate_example
 
 load_dotenv()
@@ -35,7 +38,14 @@ load_dotenv()
     default=None,
     help="The base URL of the API to use for translation.",
 )
-def main(model: str, api_base: str) -> None:
+@click.option(
+    "--concurrency",
+    type=click.IntRange(min=1),
+    default=1,
+    show_default=True,
+    help="Maximum simultaneous translations per language.",
+)
+def main(model: str, api_base: str, concurrency: int) -> None:
     """Translate the BFCL-v2 dataset to different languages."""
     disable_progress_bars()
     warnings.filterwarnings("ignore", category=UserWarning)
@@ -48,7 +58,7 @@ def main(model: str, api_base: str) -> None:
     for language in tqdm(
         iterable=load_languages(), desc="Translating datasets", unit="dataset"
     ):
-        language_examples = deepcopy(examples)
+        language_examples = list(examples)
 
         language_output_path = output_dir / f"bfcl-{language.code}.jsonl"
         if language_output_path.exists():
@@ -58,10 +68,11 @@ def main(model: str, api_base: str) -> None:
                     for line in f.readlines()
                     if line.strip()
                 ]
+            existing_ids = {example.id for example in existing_examples}
             language_examples = [
                 example
                 for example in language_examples
-                if example not in existing_examples
+                if example.id not in existing_ids
             ]
 
         dataset = load_dataset(
@@ -71,63 +82,136 @@ def main(model: str, api_base: str) -> None:
             download_config=DownloadConfig(disable_tqdm=True),
         )
 
-        for example in tqdm(
-            iterable=language_examples,
-            desc=f"Translating examples to {language.name}",
-            unit="example",
-            leave=False,
-        ):
-            # Load the example text
-            example_text = dataset.shuffle()[0]["context"]
-            special_symbol_fraction = sum(
-                1 for char in example_text if char in punctuation
-            ) / len(example_text)
+        contexts = [row["context"] for row in dataset if row["context"]]
+        random.shuffle(contexts)
+        _translate_examples(
+            examples=language_examples,
+            contexts=contexts,
+            language=language,
+            output_path=language_output_path,
+            model=model,
+            api_base=api_base,
+            concurrency=concurrency,
+        )
 
-            # Ensure that the example text is not full of special symbols like tables
-            best_example_text = example_text
-            best_special_symbol_fraction = special_symbol_fraction
-            for _ in range(10):
-                if special_symbol_fraction < 0.05:
-                    break
-                example_text = dataset.shuffle()[0]["context"]
-                special_symbol_fraction = sum(
-                    1 for char in example_text if char in punctuation
-                ) / len(example_text)
-                if special_symbol_fraction < best_special_symbol_fraction:
-                    best_special_symbol_fraction = special_symbol_fraction
-                    best_example_text = example_text
-            else:
-                example_text = best_example_text
 
-            assert isinstance(example_text, str), (
-                f"Expected a string, but got {type(example_text)}"
+def _translate_examples(
+    examples: list[Example],
+    contexts: list[str],
+    language: Language,
+    output_path: Path,
+    model: str,
+    api_base: str,
+    concurrency: int,
+) -> None:
+    """Translate examples while keeping all checkpoint writes on this thread.
+
+    Raises:
+        KeyboardInterrupt:
+            When the user interrupts translation; completed calls are checkpointed.
+    """
+    if not examples:
+        return
+    if not contexts:
+        warnings.warn(f"No contexts available for {language.name}; skipping language.")
+        return
+
+    context_iterator = _usable_contexts(contexts)
+    progress = tqdm(
+        iterable=zip(examples, context_iterator),
+        total=len(examples),
+        desc=f"Translating examples to {language.name}",
+        unit="example",
+        leave=False,
+    )
+
+    def translate(example: Example, context: str) -> Example:
+        return translate_example(
+            example=example,
+            language=language,
+            language_example=context,
+            model=model,
+            api_base=api_base,
+        )
+
+    def save(future: Future[Example], example: Example) -> None:
+        try:
+            translated = future.result()
+        except Exception as error:
+            click.echo(
+                f"Failed to translate example {example.id} to {language.name}. "
+                f"Skipping. Here are the errors that occurred:\n{error}",
+                err=True,
             )
+            return
+        with output_path.open("a") as output_file:
+            output_file.write(translated.model_dump_json() + "\n")
 
-            # Remove the example text from the dataset, unless it's the last example
-            filtered_dataset = dataset.filter(lambda x: x["context"] != example_text)
-            if len(filtered_dataset) > 1:
-                dataset = filtered_dataset
-                assert isinstance(dataset, Dataset), (
-                    f"Expected a Dataset, but got {type(dataset)}"
-                )
-
+    if concurrency == 1:
+        for example, context in progress:
             try:
-                translated_example = translate_example(
-                    example=example,
-                    language=language,
-                    language_example=example_text,
-                    model=model,
-                    api_base=api_base,
-                )
-            except Exception as e:
-                warnings.warn(
+                translated = translate(example, context)
+            except Exception as error:
+                click.echo(
                     f"Failed to translate example {example.id} to {language.name}. "
-                    f"Skipping. Here are the errors that occurred:\n{e}"
+                    f"Skipping. Here are the errors that occurred:\n{error}",
+                    err=True,
                 )
                 continue
+            with output_path.open("a") as output_file:
+                output_file.write(translated.model_dump_json() + "\n")
+        return
 
-            with language_output_path.open("a") as f:
-                f.write(translated_example.model_dump_json() + "\n")
+    executor = ThreadPoolExecutor(max_workers=concurrency)
+    pending: dict[Future[Example], Example] = {}
+    iterator = iter(progress)
+    try:
+        while True:
+            while len(pending) < concurrency:
+                try:
+                    example, context = next(iterator)
+                except StopIteration:
+                    break
+                pending[executor.submit(translate, example, context)] = example
+            if not pending:
+                break
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in completed:
+                example = pending.pop(future)
+                save(future, example)
+    except KeyboardInterrupt:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+        for future, example in pending.items():
+            if not future.cancelled():
+                save(future, example)
+        raise
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _usable_contexts(contexts: list[str]) -> c.Iterator[str]:
+    """Yield varied contexts, preferring examples with little punctuation."""
+    pool = list(contexts)
+    random.shuffle(pool)
+    position = 0
+    while True:
+        if position >= len(pool):
+            random.shuffle(pool)
+            position = 0
+        best_context = ""
+        best_fraction = float("inf")
+        for _ in range(min(11, len(pool) - position)):
+            context = pool[position]
+            position += 1
+            fraction = sum(char in punctuation for char in context) / len(context)
+            if fraction < best_fraction:
+                best_context = context
+                best_fraction = fraction
+            if fraction < 0.05:
+                break
+        yield best_context
 
 
 if __name__ == "__main__":
