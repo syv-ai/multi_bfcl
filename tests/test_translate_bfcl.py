@@ -88,10 +88,12 @@ def test_concurrency_runs_multiple_translations(
     assert len(set(ids)) == 5
 
 
-def test_failures_do_not_prevent_successful_checkpoints(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("concurrency", [1, 20])
+def test_transient_translation_failures_are_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, concurrency: int
 ) -> None:
-    """A failed translation is reported without blocking other output."""
+    """Transient outages recover in sequential and worker-pool modes."""
+    attempts: dict[str, int] = {}
 
     def fake_translate(
         example: Example,
@@ -100,11 +102,13 @@ def test_failures_do_not_prevent_successful_checkpoints(
         model: str,
         api_base: str | None,
     ) -> Example:
-        if example.id == "example-1":
-            raise RuntimeError("offline failure")
+        attempts[example.id] = attempts.get(example.id, 0) + 1
+        if attempts[example.id] == 1:
+            raise RuntimeError("fetch failed")
         return example
 
     monkeypatch.setattr(translate_bfcl, "translate_example", fake_translate)
+    monkeypatch.setattr(translate_bfcl.time, "sleep", lambda delay: None)
     output_path = tmp_path / "output.jsonl"
     translate_bfcl._translate_examples(
         examples=_examples(3),
@@ -113,14 +117,51 @@ def test_failures_do_not_prevent_successful_checkpoints(
         output_path=output_path,
         model="offline",
         api_base="",
-        concurrency=2,
+        concurrency=concurrency,
     )
     ids = [
         Example.model_validate_json(line).id
         for line in output_path.read_text().splitlines()
     ]
-    assert sorted(ids) == ["example-0", "example-2"]
-    assert "example-1" in capsys.readouterr().err
+    assert sorted(ids) == ["example-0", "example-1", "example-2"]
+    assert set(attempts.values()) == {2}
+
+
+def test_permanent_translation_failure_aborts_and_keeps_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A permanent error stops the run while preserving successful rows."""
+    calls: list[str] = []
+
+    def fake_translate(
+        example: Example,
+        language: Language,
+        language_example: str,
+        model: str,
+        api_base: str | None,
+    ) -> Example:
+        calls.append(example.id)
+        if example.id == "example-1":
+            raise ValueError("invalid request")
+        return example
+
+    monkeypatch.setattr(translate_bfcl, "translate_example", fake_translate)
+    output_path = tmp_path / "output.jsonl"
+    with pytest.raises(RuntimeError, match="example-1"):
+        translate_bfcl._translate_examples(
+            examples=_examples(3),
+            contexts=["ordinary context"],
+            language=Language(code="xx", name="Example"),
+            output_path=output_path,
+            model="offline",
+            api_base="",
+            concurrency=1,
+        )
+    assert calls == ["example-0", "example-1"]
+    assert [
+        Example.model_validate_json(line).id
+        for line in output_path.read_text().splitlines()
+    ] == ["example-0"]
 
 
 def test_resume_skips_existing_ids(
@@ -162,6 +203,55 @@ def test_resume_skips_existing_ids(
         for line in output_path.read_text().splitlines()
     ]
     assert ids == ["example-0", "example-1"]
+
+
+def test_language_dataset_cache_error_is_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Hugging Face's cache ValueError is retried as a possible outage."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(translate_bfcl, "load_bfcl", lambda: _examples(1))
+    monkeypatch.setattr(
+        translate_bfcl, "load_languages", lambda: [Language("xx", "Example")]
+    )
+    monkeypatch.setattr(translate_bfcl.time, "sleep", lambda delay: None)
+    calls = 0
+
+    def fake_load_dataset(*args: object, **kwargs: object) -> list[dict[str, str]]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("Couldn't find cache for dataset config 'xx'")
+        return [{"context": "ordinary context"}]
+
+    monkeypatch.setattr(translate_bfcl, "load_dataset", fake_load_dataset)
+    monkeypatch.setattr(
+        translate_bfcl, "translate_example", lambda example, **kwargs: example
+    )
+    result = CliRunner().invoke(translate_bfcl.main, [])
+    assert result.exit_code == 0, result.output
+    assert calls == 2
+
+
+def test_completed_language_skips_dataset_loading(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A complete checkpoint does not need a language dataset download."""
+    monkeypatch.chdir(tmp_path)
+    output_path = tmp_path / "data" / "bfcl-xx.jsonl"
+    output_path.parent.mkdir()
+    output_path.write_text(_examples(1)[0].model_dump_json() + "\n")
+    monkeypatch.setattr(translate_bfcl, "load_bfcl", lambda: _examples(1))
+    monkeypatch.setattr(
+        translate_bfcl, "load_languages", lambda: [Language("xx", "Example")]
+    )
+
+    def fail_if_loaded(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dataset should not be loaded for a completed language")
+
+    monkeypatch.setattr(translate_bfcl, "load_dataset", fail_if_loaded)
+    result = CliRunner().invoke(translate_bfcl.main, [])
+    assert result.exit_code == 0, result.output
 
 
 def test_resume_discards_only_invalid_partial_final_record(tmp_path: Path) -> None:
