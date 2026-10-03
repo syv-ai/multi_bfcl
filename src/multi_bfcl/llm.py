@@ -1,5 +1,6 @@
 """Generation with a large language model."""
 
+import os
 import typing as t
 
 import litellm
@@ -41,6 +42,10 @@ def generate(
             happening in the response format.
     """
     conversation = [dict(role="user", content=prompt)]
+    api_key = os.environ.get("OPENAI_API_KEY")
+    auth_kwargs = (
+        {"api_key": api_key or "dummy-api-key"} if api_base is not None else {}
+    )
 
     response = litellm.completion(  # pyrefly: ignore[not-callable]
         model=model if api_base is None else f"openai/{model}",
@@ -49,6 +54,7 @@ def generate(
         temperature=temperature,
         response_format=response_format,
         timeout=600,
+        **auth_kwargs,
     )
     assert isinstance(response, ModelResponse), (
         f"Expected a ModelResponse object, but got {type(response)}"
@@ -79,6 +85,7 @@ def generate(
                     temperature=temperature,
                     response_format=response_format,
                     timeout=600,
+                    **auth_kwargs,
                 )
                 choice = response.choices[0]
                 assert isinstance(choice, Choices), (
